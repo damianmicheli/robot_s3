@@ -3,6 +3,9 @@ idf_component_register(
         "main.c"
         "button.c"
         "display.c"
+        "font_roboto_24.c"
+        "font_merienda_18.c"
+        "font_merienda_24.c"
        
     INCLUDE_DIRS "."
     PRIV_REQUIRES
@@ -11,4 +14,5 @@ idf_component_register(
         spi_flash
         esp_psram
         esp_driver_spi
+        esp_lcd
 )

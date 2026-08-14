@@ -1,205 +1,128 @@
 #include "display.h"
 
-#include <stdbool.h>
-#include <stdint.h>
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_lcd_io_spi.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lvgl_port.h"
 #include "esp_random.h"
-#include "esp_rom_sys.h"
 
-/*
- * GMT020-02-7P (ST7789V), interfaz SPI de 4 hilos.
- * Ajusta estos cinco GPIO a los que uses en tu ESP32-S3.
- * SDA de la pantalla es MOSI y SCL es SCLK (no son I2C).
- */
+/* GMT020-02-7P: SDA es MOSI y SCL es SCLK (no I2C). */
 #define TFT_PIN_MOSI GPIO_NUM_11
 #define TFT_PIN_SCLK GPIO_NUM_12
 #define TFT_PIN_CS   GPIO_NUM_10
 #define TFT_PIN_DC   GPIO_NUM_13
 #define TFT_PIN_RST  GPIO_NUM_14
-
 #define TFT_HOST     SPI2_HOST
 #define TFT_WIDTH    240
 #define TFT_HEIGHT   320
-#define TFT_CMD_MODE 0
-#define TFT_DATA_MODE 1
 
-static spi_device_handle_t s_tft;
+static esp_lcd_panel_handle_t s_panel;
+static esp_lcd_panel_io_handle_t s_panel_io;
+static lv_obj_t *s_message_label;
 
-static void tft_write(bool data, const void *buffer, size_t length)
+/* Fuente Roboto 24 px generada desde el archivo TTF con lv_font_conv. */
+extern const lv_font_t font_roboto_24;
+extern const lv_font_t font_merienda_18;
+extern const lv_font_t font_merienda_24;
+
+/* Escribe los parámetros eléctricos específicos que eliminan el ruido del panel. */
+static void configure_gmt020_panel(void)
 {
-    gpio_set_level(TFT_PIN_DC, data ? TFT_DATA_MODE : TFT_CMD_MODE);
-    spi_transaction_t transaction = {
-        .length = length * 8,
-        .tx_buffer = buffer,
+    static const uint8_t porch[] = { 0x0C, 0x0C, 0x00, 0x33, 0x33 };
+    static const uint8_t power[] = { 0xA4, 0xA1 };
+    static const uint8_t gamma_pos[] = { 0xD0, 0x01, 0x08, 0x0F, 0x11, 0x2A, 0x36, 0x55, 0x44, 0x3A, 0x0B, 0x06, 0x11, 0x20 };
+    static const uint8_t gamma_neg[] = { 0xD0, 0x02, 0x07, 0x0A, 0x0B, 0x18, 0x34, 0x43, 0x4A, 0x2B, 0x1B, 0x1C, 0x22, 0x1F };
+    static const uint8_t one[] = { 0x35, 0x28, 0x2C, 0x01, 0x0B, 0x20, 0x0F };
+    static const struct { uint8_t cmd; const uint8_t *data; size_t len; } commands[] = {
+        {0xB2, porch, sizeof(porch)}, {0xB7, &one[0], 1}, {0xBB, &one[1], 1},
+        {0xC0, &one[2], 1}, {0xC2, &one[3], 1}, {0xC3, &one[4], 1},
+        {0xC4, &one[5], 1}, {0xC6, &one[6], 1}, {0xD0, power, sizeof(power)},
+        {0xE0, gamma_pos, sizeof(gamma_pos)}, {0xE1, gamma_neg, sizeof(gamma_neg)},
     };
-    ESP_ERROR_CHECK(spi_device_polling_transmit(s_tft, &transaction));
-}
-
-static void tft_command(uint8_t command, const uint8_t *data, size_t length)
-{
-    tft_write(false, &command, 1);
-    if (length) {
-        tft_write(true, data, length);
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(s_panel_io, commands[i].cmd, commands[i].data, commands[i].len));
     }
 }
 
-static void tft_window(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+/* Permite elegir la fuente desde una cadena, sin exponer detalles de LVGL al resto del programa. */
+static const lv_font_t *font_from_name(const char *name)
 {
-    uint8_t area[] = { x >> 8, x, (uint16_t)(x + width - 1) >> 8,
-                       (uint8_t)(x + width - 1) };
-    tft_command(0x2A, area, sizeof(area));
-    uint8_t page[] = { y >> 8, y, (uint16_t)(y + height - 1) >> 8,
-                       (uint8_t)(y + height - 1) };
-    tft_command(0x2B, page, sizeof(page));
-    tft_command(0x2C, NULL, 0);
-}
-
-static void tft_fill(uint16_t color)
-{
-    uint8_t pixels[240 * 2];
-    for (size_t i = 0; i < sizeof(pixels); i += 2) {
-        pixels[i] = color >> 8;
-        pixels[i + 1] = color;
-    }
-    tft_window(0, 0, TFT_WIDTH, TFT_HEIGHT);
-    for (int line = 0; line < TFT_HEIGHT; line++) {
-        tft_write(true, pixels, sizeof(pixels));
-    }
-}
-
-/* Fuente 5x7 para las letras usadas por el mensaje. */
-static const uint8_t font[][5] = {
-    [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
-    ['a'] = {0x20, 0x54, 0x54, 0x54, 0x78},
-    ['b'] = {0x7F, 0x48, 0x44, 0x44, 0x38},
-    ['d'] = {0x38, 0x44, 0x44, 0x48, 0x7F},
-    ['e'] = {0x38, 0x54, 0x54, 0x54, 0x18},
-    ['i'] = {0x00, 0x44, 0x7D, 0x40, 0x00},
-    ['n'] = {0x7C, 0x08, 0x04, 0x04, 0x78},
-    ['o'] = {0x38, 0x44, 0x44, 0x44, 0x38},
-    ['p'] = {0x7C, 0x14, 0x14, 0x14, 0x08},
-    ['r'] = {0x7C, 0x08, 0x04, 0x04, 0x08},
-    ['s'] = {0x48, 0x54, 0x54, 0x54, 0x24},
-    ['t'] = {0x04, 0x3F, 0x44, 0x40, 0x20},
-};
-
-static void tft_pixel(uint16_t x, uint16_t y, uint16_t color)
-{
-    uint8_t pixel[] = { color >> 8, color };
-    tft_window(x, y, 1, 1);
-    tft_write(true, pixel, sizeof(pixel));
-}
-
-static void tft_char(uint16_t x, uint16_t y, char c, uint8_t scale, uint16_t color)
-{
-    for (int column = 0; column < 5; column++) {
-        uint8_t bits = font[(unsigned char)c][column];
-        for (int row = 0; row < 7; row++) {
-            if (bits & (1 << row)) {
-                for (int dx = 0; dx < scale; dx++) {
-                    for (int dy = 0; dy < scale; dy++) {
-                        tft_pixel(x + column * scale + dx, y + row * scale + dy, color);
-                    }
-                }
-            }
-        }
-    }
+    if (strcmp(name, "roboto_24") == 0) return &font_roboto_24;
+    if (strcmp(name, "merienda_18") == 0) return &font_merienda_18;
+    if (strcmp(name, "merienda_24") == 0) return &font_merienda_24;
+    if (strcmp(name, "montserrat_14") == 0) return &lv_font_montserrat_14;
+    return &lv_font_montserrat_14; /* Fuente segura por defecto. */
 }
 
 esp_err_t display_init(void)
 {
-    gpio_config_t reset_config = {
-        .pin_bit_mask = 1ULL << TFT_PIN_DC | 1ULL << TFT_PIN_RST,
-        .mode = GPIO_MODE_OUTPUT,
+    const spi_bus_config_t bus = {
+        .mosi_io_num = TFT_PIN_MOSI, .miso_io_num = GPIO_NUM_NC,
+        .sclk_io_num = TFT_PIN_SCLK, .quadwp_io_num = GPIO_NUM_NC, .quadhd_io_num = GPIO_NUM_NC,
+        .max_transfer_sz = TFT_WIDTH * 40 * sizeof(uint16_t),
     };
-    ESP_ERROR_CHECK(gpio_config(&reset_config));
+    const esp_lcd_panel_io_spi_config_t io = {
+        .cs_gpio_num = TFT_PIN_CS, .dc_gpio_num = TFT_PIN_DC, .spi_mode = 0,
+        .pclk_hz = 20 * 1000 * 1000, .trans_queue_depth = 10, .lcd_cmd_bits = 8, .lcd_param_bits = 8,
+    };
+    const esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = TFT_PIN_RST, .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE, .bits_per_pixel = 16,
+    };
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(TFT_HOST, &bus, SPI_DMA_CH_AUTO), "TFT", "SPI");
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi(TFT_HOST, &io, &s_panel_io), "TFT", "IO SPI");
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_panel_io, &panel_cfg, &s_panel), "TFT", "ST7789V");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), "TFT", "reset");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), "TFT", "init");
+    configure_gmt020_panel();
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    spi_bus_config_t bus_config = {
-        .mosi_io_num = TFT_PIN_MOSI,
-        .miso_io_num = GPIO_NUM_NC,
-        .sclk_io_num = TFT_PIN_SCLK,
-        .quadwp_io_num = GPIO_NUM_NC,
-        .quadhd_io_num = GPIO_NUM_NC,
+    const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), "LVGL", "init");
+    const lvgl_port_display_cfg_t display_cfg = {
+        .io_handle = s_panel_io, .panel_handle = s_panel,
+        .buffer_size = TFT_WIDTH * 40, .double_buffer = true,
+        .hres = TFT_WIDTH, .vres = TFT_HEIGHT,
+        .flags = {.buff_dma = true},
     };
-    spi_device_interface_config_t device_config = {
-        .clock_speed_hz = 20 * 1000 * 1000,
-        .mode = 0,
-        .spics_io_num = TFT_PIN_CS,
-        .queue_size = 1,
-    };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(TFT_HOST, &bus_config, SPI_DMA_CH_AUTO), "TFT", "SPI init");
-    ESP_RETURN_ON_ERROR(spi_bus_add_device(TFT_HOST, &device_config, &s_tft), "TFT", "SPI device");
+    if (lvgl_port_add_disp(&display_cfg) == NULL) return ESP_ERR_NO_MEM;
 
-    gpio_set_level(TFT_PIN_RST, 0);
-    esp_rom_delay_us(20 * 1000);
-    gpio_set_level(TFT_PIN_RST, 1);
-    esp_rom_delay_us(120 * 1000);
-
-    tft_command(0x01, NULL, 0);                 // Software reset
-    esp_rom_delay_us(150 * 1000);
-    tft_command(0x11, NULL, 0);                 // Sleep out
-    esp_rom_delay_us(120 * 1000);
-    const uint8_t color_mode = 0x55;            // RGB565
-    const uint8_t orientation = 0x00;           // Orientación nativa: 240 x 320
-    const uint8_t porch[] = { 0x0C, 0x0C, 0x00, 0x33, 0x33 };
-    const uint8_t gate = 0x35;
-    const uint8_t vcom = 0x28;
-    const uint8_t lcm = 0x2C;
-    const uint8_t vdv_vrhs_enable = 0x01;
-    const uint8_t vrhs = 0x0B;
-    const uint8_t vdv = 0x20;
-    const uint8_t frame_rate = 0x0F;
-    const uint8_t power[] = { 0xA4, 0xA1 };
-    const uint8_t gamma_positive[] = {
-        0xD0, 0x01, 0x08, 0x0F, 0x11, 0x2A, 0x36,
-        0x55, 0x44, 0x3A, 0x0B, 0x06, 0x11, 0x20,
-    };
-    const uint8_t gamma_negative[] = {
-        0xD0, 0x02, 0x07, 0x0A, 0x0B, 0x18, 0x34,
-        0x43, 0x4A, 0x2B, 0x1B, 0x1C, 0x22, 0x1F,
-    };
-
-    /* Parámetros recomendados por ST7789V; eliminan artefactos en el panel. */
-    tft_command(0xB2, porch, sizeof(porch));
-    tft_command(0xB7, &gate, 1);
-    tft_command(0xBB, &vcom, 1);
-    tft_command(0xC0, &lcm, 1);
-    tft_command(0xC2, &vdv_vrhs_enable, 1);
-    tft_command(0xC3, &vrhs, 1);
-    tft_command(0xC4, &vdv, 1);
-    tft_command(0xC6, &frame_rate, 1);
-    tft_command(0xD0, power, sizeof(power));
-    tft_command(0xE0, gamma_positive, sizeof(gamma_positive));
-    tft_command(0xE1, gamma_negative, sizeof(gamma_negative));
-    tft_command(0x3A, &color_mode, 1);
-    tft_command(0x36, &orientation, 1);
-    tft_command(0x21, NULL, 0);                 // Inversión necesaria en esta pantalla
-    tft_command(0x29, NULL, 0);                 // Display on
-    tft_fill(0x0000);
+    lvgl_port_lock(0);
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
+    s_message_label = lv_label_create(screen);
+    lv_label_set_text(s_message_label, "");
+    lv_obj_set_style_text_opa(s_message_label, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(s_message_label, font_from_name("merienda_24"), 0);
+    lv_obj_set_style_bg_opa(s_message_label, LV_OPA_TRANSP, 0);
+    lv_obj_center(s_message_label);
+    lvgl_port_unlock();
     return ESP_OK;
 }
 
 void display_show_button_pressed(void)
 {
-    static const char message[] = "boton presionado";
-    const uint8_t scale = 2;
-    const uint16_t text_width = (sizeof(message) - 1) * 6 * scale;
-    const uint16_t x = (TFT_WIDTH - text_width) / 2;
-    const uint16_t y = (TFT_HEIGHT - 7 * scale) / 2;
-    const uint16_t background = (uint16_t)esp_random();
-    const uint8_t red = background >> 11;
-    const uint8_t green = (background >> 5) & 0x3F;
-    const uint8_t blue = background & 0x1F;
-    const uint16_t text_color = (red * 299 + green * 150 + blue * 299 > 12000)
-                                    ? 0x0000
-                                    : 0xFFFF;
+    const uint32_t color = esp_random() & 0x00FFFFFF;
+    const uint8_t red = color >> 16;
+    const uint8_t green = color >> 8;
+    const uint8_t blue = color;
+    const bool light_background = red * 299 + green * 587 + blue * 114 > 128000;
 
-    tft_fill(background);
-    for (size_t i = 0; i < sizeof(message) - 1; i++) {
-        tft_char(x + i * 6 * scale, y, message[i], scale, text_color);
-    }
+    /* Texto negro en fondos claros y blanco en fondos oscuros. */
+    lvgl_port_lock(0);
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_set_style_bg_color(screen, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(s_message_label,
+                                light_background ? lv_color_black() : lv_color_white(), 0);
+    lv_label_set_text(s_message_label, "boton presionado");
+    lv_obj_remove_flag(s_message_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(s_message_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_invalidate(s_message_label);
+    lvgl_port_unlock();
 }

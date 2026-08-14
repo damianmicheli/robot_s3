@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "button.c"
+        "display.c"
        
     INCLUDE_DIRS "."
     PRIV_REQUIRES
@@ -9,4 +10,5 @@ idf_component_register(
         esp_timer
         spi_flash
         esp_psram
+        esp_driver_spi
 )

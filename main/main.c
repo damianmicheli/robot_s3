@@ -7,6 +7,7 @@
 #include "esp_psram.h"
 
 #include "button.h"
+#include "display.h"
 
 static const char *TAG = "ROBOT";
 static const char *BUTTON_TAG = "BUTTON";
@@ -26,6 +27,7 @@ void app_main(void)
     );
 
     button_init();
+    ESP_ERROR_CHECK(display_init());
 
     ESP_LOGI(TAG, "Boton inicializado en GPIO4");
 
@@ -34,6 +36,7 @@ void app_main(void)
         if (button_was_pressed())
         {
             ESP_LOGI(BUTTON_TAG, "Boton presionado");
+            display_show_button_pressed();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));

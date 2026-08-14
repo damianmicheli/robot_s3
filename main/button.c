@@ -62,3 +62,9 @@ bool button_was_pressed(void)
 
     return false;
 }
+
+bool button_is_pressed(void)
+{
+    /* button_was_pressed() actualiza este estado estable y elimina rebotes. */
+    return s_stable_state == 0;
+}

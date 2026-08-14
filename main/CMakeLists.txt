@@ -3,8 +3,7 @@ idf_component_register(
         "main.c"
         "button.c"
         "display.c"
-        "font_roboto_24.c"
-        "font_merienda_18.c"
+        "rgb_led.c"
         "font_merienda_24.c"
        
     INCLUDE_DIRS "."

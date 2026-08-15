@@ -51,6 +51,8 @@ void app_main(void)
             display_show_recording();
             rgb_led_set_color(255, 0, 0);
 
+            /* Permite que LVGL dibuje GRABANDO antes de iniciar la lectura I2S. */
+            vTaskDelay(pdMS_TO_TICKS(100));
             esp_err_t result = microphone_record_five_seconds();
             if (result != ESP_OK) {
                 ESP_LOGE(TAG, "Error durante la grabacion: %s", esp_err_to_name(result));

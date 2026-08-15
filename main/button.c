@@ -7,7 +7,7 @@
 #include "esp_timer.h"
 
 #define BUTTON_DEBOUNCE_MS 50
-#define PIN_BUTTON      GPIO_NUM_4
+#define BUTTON_GPIO        GPIO_NUM_4
 
 static int s_raw_state = 1;
 static int s_stable_state = 1;
@@ -16,7 +16,7 @@ static int64_t s_last_raw_change_ms = 0;
 void button_init(void)
 {
     gpio_config_t config = {
-        .pin_bit_mask = 1ULL << PIN_BUTTON,
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -25,7 +25,7 @@ void button_init(void)
 
     ESP_ERROR_CHECK(gpio_config(&config));
 
-    int initial_state = gpio_get_level(PIN_BUTTON);
+    int initial_state = gpio_get_level(BUTTON_GPIO);
 
     s_raw_state = initial_state;
     s_stable_state = initial_state;
@@ -34,7 +34,7 @@ void button_init(void)
 
 bool button_was_pressed(void)
 {
-    int raw_state = gpio_get_level(PIN_BUTTON);
+    int raw_state = gpio_get_level(BUTTON_GPIO);
     int64_t now_ms = esp_timer_get_time() / 1000;
 
     if (raw_state != s_raw_state)
@@ -61,10 +61,4 @@ bool button_was_pressed(void)
     }
 
     return false;
-}
-
-bool button_is_pressed(void)
-{
-    /* button_was_pressed() actualiza este estado estable y elimina rebotes. */
-    return s_stable_state == 0;
 }

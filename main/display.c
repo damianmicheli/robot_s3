@@ -9,9 +9,6 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lvgl_port.h"
-#include "esp_random.h"
-
-#include "rgb_led.h"
 
 /* Conexiones: SDA es MOSI y SCL es SCLK; esta pantalla no usa I2C. */
 #define TFT_MOSI_GPIO GPIO_NUM_11
@@ -129,28 +126,23 @@ esp_err_t display_init(void)
     return ESP_OK;
 }
 
-void display_set_power(bool enabled)
+static void display_show_status(const char *message, uint32_t background, lv_color_t text_color)
 {
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, enabled));
-}
-
-void display_show_button_pressed(void)
-{
-    const uint32_t background = esp_random() & 0x00FFFFFF;
-    const uint8_t red = background >> 16;
-    const uint8_t green = background >> 8;
-    const uint8_t blue = background;
-    const bool is_light = red * 299 + green * 587 + blue * 114 > 128000;
-
-    /* El LED y la pantalla reciben exactamente el mismo color RGB. */
-    rgb_led_set_color(red, green, blue);
-
     /* LVGL necesita su mutex porque atiende la interfaz en su propia tarea. */
     lvgl_port_lock(0);
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(background), 0);
-    lv_obj_set_style_text_color(s_message_label,
-                                is_light ? lv_color_black() : lv_color_white(), 0);
-    lv_label_set_text(s_message_label, "boton presionado");
+    lv_obj_set_style_text_color(s_message_label, text_color, 0);
+    lv_label_set_text(s_message_label, message);
     lv_obj_align(s_message_label, LV_ALIGN_CENTER, 0, 0);
     lvgl_port_unlock();
+}
+
+void display_show_standby(void)
+{
+    display_show_status("STAND BY", 0x000000, lv_color_white());
+}
+
+void display_show_recording(void)
+{
+    display_show_status("GRABANDO", 0xFF0000, lv_color_white());
 }

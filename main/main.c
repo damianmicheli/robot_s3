@@ -5,15 +5,17 @@
 #include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_psram.h"
-#include "esp_timer.h"
 
 #include "button.h"
 #include "display.h"
+#include "llm.h"
+#include "microphone.h"
+#include "network.h"
 #include "rgb_led.h"
+#include "transcription.h"
 
 static const char *TAG = "ROBOT";
 static const char *BUTTON_TAG = "BUTTON";
-#define BUTTON_HOLD_TO_TOGGLE_OUTPUTS_MS 4000
 
 void app_main(void)
 {
@@ -32,50 +34,43 @@ void app_main(void)
     button_init();
     ESP_ERROR_CHECK(rgb_led_init());
     ESP_ERROR_CHECK(display_init());
+    ESP_ERROR_CHECK(microphone_init());
 
-    ESP_LOGI(TAG, "Boton inicializado en GPIO4");
+    display_show_standby();
+    rgb_led_off();
 
-    int64_t pressed_since_ms = -1;
-    bool outputs_are_off = false;
-    bool long_press_handled = false;
+    if (network_connect() != ESP_OK) ESP_LOGW(TAG, "Wi-Fi no conectado; se reintentara al enviar");
+
+    ESP_LOGI(TAG, "Listo: STAND BY. Pulsa el boton para grabar 5 segundos.");
 
     while (1)
     {
         if (button_was_pressed())
         {
-            pressed_since_ms = esp_timer_get_time() / 1000;
-            long_press_handled = false;
-            if (!outputs_are_off) {
-                ESP_LOGI(BUTTON_TAG, "Boton presionado");
-                display_show_button_pressed();
-            }
-        }
+            ESP_LOGI(BUTTON_TAG, "Grabacion iniciada");
+            display_show_recording();
+            rgb_led_set_color(255, 0, 0);
 
-        if (!button_is_pressed())
-        {
-            pressed_since_ms = -1;
-            /* La proxima pulsacion puede volver a ejecutar una accion larga. */
-            long_press_handled = false;
-        }
-        else if (!long_press_handled && pressed_since_ms >= 0 &&
-                 esp_timer_get_time() / 1000 - pressed_since_ms >= BUTTON_HOLD_TO_TOGGLE_OUTPUTS_MS)
-        {
-            /*
-             * Se ejecuta una vez por pulsacion: al cambiar el estado se evita que
-             * siga alternando mientras el boton continua presionado.
-             */
-            if (outputs_are_off) {
-                display_set_power(true);
-                outputs_are_off = false;
-                display_show_button_pressed();
-                ESP_LOGI(BUTTON_TAG, "Pantalla y LED encendidos por pulsacion larga");
-            } else {
-                display_set_power(false);
-                rgb_led_off();
-                outputs_are_off = true;
-                ESP_LOGI(BUTTON_TAG, "Pantalla y LED apagados por pulsacion larga");
+            esp_err_t result = microphone_record_five_seconds();
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "Error durante la grabacion: %s", esp_err_to_name(result));
             }
-            long_press_handled = true;
+
+            rgb_led_off();
+            display_show_standby();
+
+            /* Deja que la tarea de LVGL envíe STAND BY antes de las llamadas HTTP. */
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            if (result == ESP_OK) {
+                result = network_connect();
+                if (result == ESP_OK) result = transcription_send_last_recording();
+                if (result == ESP_OK) result = llm_answer(transcription_get_last_text());
+                if (result != ESP_OK) ESP_LOGE(TAG, "No se pudo transcribir: %s", esp_err_to_name(result));
+            }
+
+            /* También recupera la interfaz al terminar o si hubo un error de red. */
+            display_show_standby();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));

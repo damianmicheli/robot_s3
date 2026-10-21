@@ -7,7 +7,9 @@ idf_component_register(
         "microphone.c"
         "network.c"
         "rgb_led.c"
+        "speaker.c"
         "transcription.c"
+        "tts.c"
         "font_merienda_24.c"
        
     INCLUDE_DIRS "."

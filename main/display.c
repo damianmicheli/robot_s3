@@ -146,3 +146,8 @@ void display_show_recording(void)
 {
     display_show_status("GRABANDO", 0xFF0000, lv_color_white());
 }
+
+void display_show_speaking(void)
+{
+    display_show_status("HABLANDO", 0x0040C0, lv_color_white());
+}

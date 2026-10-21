@@ -7,3 +7,4 @@
 esp_err_t display_init(void);
 void display_show_standby(void);
 void display_show_recording(void);
+void display_show_speaking(void);

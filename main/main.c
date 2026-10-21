@@ -13,6 +13,8 @@
 #include "network.h"
 #include "rgb_led.h"
 #include "transcription.h"
+#include "speaker.h"
+#include "tts.h"
 
 static const char *TAG = "ROBOT";
 static const char *BUTTON_TAG = "BUTTON";
@@ -35,9 +37,11 @@ void app_main(void)
     ESP_ERROR_CHECK(rgb_led_init());
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(microphone_init());
+    ESP_ERROR_CHECK(speaker_init());
 
     display_show_standby();
     rgb_led_off();
+    ESP_ERROR_CHECK(speaker_play_startup_tone());
 
     if (network_connect() != ESP_OK) ESP_LOGW(TAG, "Wi-Fi no conectado; se reintentara al enviar");
 
@@ -68,7 +72,13 @@ void app_main(void)
                 result = network_connect();
                 if (result == ESP_OK) result = transcription_send_last_recording();
                 if (result == ESP_OK) result = llm_answer(transcription_get_last_text());
-                if (result != ESP_OK) ESP_LOGE(TAG, "No se pudo transcribir: %s", esp_err_to_name(result));
+                if (result == ESP_OK) {
+                    display_show_speaking();
+                    rgb_led_set_color(0, 64, 255);
+                    result = tts_speak(llm_get_last_answer());
+                    rgb_led_off();
+                }
+                if (result != ESP_OK) ESP_LOGE(TAG, "No se pudo completar la consulta: %s", esp_err_to_name(result));
             }
 
             /* También recupera la interfaz al terminar o si hubo un error de red. */

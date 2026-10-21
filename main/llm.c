@@ -11,6 +11,7 @@ static const char *TAG = "OLLAMA";
 #define ESCAPED_TEXT_SIZE 768
 #define REQUEST_SIZE      1200
 #define RESPONSE_SIZE     2048
+static char s_last_answer[768];
 
 /* Escapa la transcripción para incluirla sin romper el JSON de la petición. */
 static size_t json_escape(char *out, size_t capacity, const char *text)
@@ -23,6 +24,22 @@ static size_t json_escape(char *out, size_t capacity, const char *text)
     }
     out[pos] = '\0';
     return pos;
+}
+
+/* Ollama responde {"message":{"content":"..."}}; extraemos el texto de voz. */
+static bool extract_answer(const char *json)
+{
+    const char *text = strstr(json, "\"content\":");
+    if (text == NULL || (text = strchr(text, ':')) == NULL) return false;
+    while (*++text == ' ') {}
+    if (*text++ != '"') return false;
+    size_t position = 0;
+    while (*text && *text != '"' && position + 1 < sizeof(s_last_answer)) {
+        if (*text == '\\' && text[1]) text++;
+        s_last_answer[position++] = *text++;
+    }
+    s_last_answer[position] = '\0';
+    return position > 0;
 }
 
 esp_err_t llm_answer(const char *user_text)
@@ -88,7 +105,17 @@ esp_err_t llm_answer(const char *user_text)
         free(response);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "Respuesta: %s", response);
+    if (!extract_answer(response)) {
+        ESP_LOGE(TAG, "No se encontro el texto en la respuesta: %s", response);
+        free(response);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Respuesta: %s", s_last_answer);
     free(response);
     return ESP_OK;
+}
+
+const char *llm_get_last_answer(void)
+{
+    return s_last_answer;
 }

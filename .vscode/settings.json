@@ -14,6 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\damia\\OneDrive\\Escritorio\\nodemcu\\esp32s3\\robot_s3\\build"
   ],
-  "idf.portWin": "COM8",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM8"
 }

@@ -43,7 +43,9 @@ void app_main(void)
     rgb_led_off();
     ESP_ERROR_CHECK(speaker_play_startup_tone());
 
-    if (network_connect() != ESP_OK) ESP_LOGW(TAG, "Wi-Fi no conectado; se reintentara al enviar");
+    if (network_connect() != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi no conectado; se reintentara al enviar");
+    }
 
     ESP_LOGI(TAG, "Listo: STAND BY. Pulsa el boton para grabar 5 segundos.");
 
@@ -55,33 +57,39 @@ void app_main(void)
             display_show_recording();
             rgb_led_set_color(255, 0, 0);
 
-            /* Permite que LVGL dibuje GRABANDO antes de iniciar la lectura I2S. */
+            /* Permite que LVGL dibuje ESCUCHANDO antes de iniciar la lectura I2S */
             vTaskDelay(pdMS_TO_TICKS(100));
             esp_err_t result = microphone_record_five_seconds();
             if (result != ESP_OK) {
                 ESP_LOGE(TAG, "Error durante la grabacion: %s", esp_err_to_name(result));
             }
 
-            rgb_led_off();
-            display_show_standby();
-
-            /* Deja que la tarea de LVGL envíe STAND BY antes de las llamadas HTTP. */
+            /* Mientras procesa STT y Ollama, muestra la carita pensando con LED ambar */
+            display_show_thinking();
+            rgb_led_set_color(255, 140, 0);
             vTaskDelay(pdMS_TO_TICKS(100));
 
             if (result == ESP_OK) {
                 result = network_connect();
-                if (result == ESP_OK) result = transcription_send_last_recording();
-                if (result == ESP_OK) result = llm_answer(transcription_get_last_text());
                 if (result == ESP_OK) {
-                    display_show_speaking();
-                    rgb_led_set_color(0, 64, 255);
-                    result = tts_speak(llm_get_last_answer());
-                    rgb_led_off();
+                    result = transcription_send_last_recording();
                 }
-                if (result != ESP_OK) ESP_LOGE(TAG, "No se pudo completar la consulta: %s", esp_err_to_name(result));
+                if (result == ESP_OK) {
+                    result = llm_answer(transcription_get_last_text());
+                }
+                if (result == ESP_OK) {
+                    /* Carita hablando con boca animada y LED cian */
+                    display_show_speaking();
+                    rgb_led_set_color(0, 180, 255);
+                    result = tts_speak(llm_get_last_answer());
+                }
+                if (result != ESP_OK) {
+                    ESP_LOGE(TAG, "No se pudo completar la consulta: %s", esp_err_to_name(result));
+                }
             }
 
-            /* También recupera la interfaz al terminar o si hubo un error de red. */
+            /* Regresa a reposo / stand by */
+            rgb_led_off();
             display_show_standby();
         }
 

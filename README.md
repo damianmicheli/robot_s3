@@ -87,10 +87,23 @@ Si Speaches u Ollama no responden, el monitor informa el código HTTP o el error
 | `microphone.c` | Configura I²S y guarda temporalmente los cinco segundos de PCM en PSRAM. |
 | `network.c` | Conecta la estación Wi-Fi y administra reintentos. |
 | `transcription.c` | Construye el WAV y lo carga a Speaches por HTTP. |
-| `llm.c` | Construye el mensaje de Ollama y registra su respuesta. |
+| `llm.c` | Construye el mensaje de Ollama, procesa respuestas y extrae el texto. |
+| `speaker.c` | Salida I²S hacia el amplificador MAX98357A con soporte para streaming WAV, control de ganancia y alineación de muestras. |
+| `tts.c` | Envía la respuesta a Speaches TTS (/v1/audio/speech) y reproduce el audio en streaming. |
 
-El proyecto usa bibliotecas oficiales de ESP-IDF para I²S, Wi-Fi, HTTP, LCD y LED, además de LVGL para la interfaz. Se evitó agregar dependencias redundantes: las partes que quedan manuales son el encabezado WAV y el cuerpo multipart, porque son formatos pequeños y estables.
+El proyecto usa bibliotecas oficiales de ESP-IDF para I²S, Wi-Fi, HTTP, LCD y LED, además de LVGL para la interfaz animada del robot.
 
-## Próximo paso
+## Interfaz gráfica del robot
 
-Agregar salida de voz: convertir la respuesta de Ollama a audio y reproducirla con un parlante/amplificador adecuado para la ESP32-S3.
+La pantalla muestra una carita animada que reacciona al estado del robot:
+- **STAND BY**: Ojos cian con pupilas y parpadeo suave periódico, mejillas sonrosadas y sonrisa descansada.
+- **ESCUCHANDO**: Ojos y boca en rojo coral alerta con LED rojo mientras graba.
+- **PENSANDO**: Ojos ambar con movimiento de pupilas y LED ambar mientras transcribe y consulta al LLM.
+- **HABLANDO**: Boca con animación fluida de visemas que abre y cierra en sincronía con la voz y LED cian.
+
+## Volumen del audio
+
+- En `speaker.c`, `SPEAKER_VOLUME_PERCENT` aplica una ganancia digital con saturación (clamping a 16 bits) para elevar el nivel de salida de Kokoro.
+- Para mayor potencia de audio física con el MAX98357A:
+  - Alimentar el módulo desde el pin de 5 V (VBUS) en vez de 3,3 V (entrega hasta 3,2 W vs 0,8 W).
+  - Conectar el pin GAIN a GND (+9 dB) o con resistencia de 100 kΩ a GND (+15 dB) según necesidad.

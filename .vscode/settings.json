@@ -4,7 +4,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
+  "idf.currentSetup": "/home/damian/.espressif/v6.1/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
@@ -15,5 +15,5 @@
     "--compile-commands-dir=c:\\Users\\damia\\OneDrive\\Escritorio\\nodemcu\\esp32s3\\robot_s3\\build"
   ],
   "idf.flashType": "UART",
-  "idf.port": "COM8"
+  "idf.port": "/dev/ttyACM0"
 }

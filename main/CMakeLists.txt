@@ -10,8 +10,8 @@ idf_component_register(
         "speaker.c"
         "transcription.c"
         "tts.c"
+        "wake_word.cpp"
         "font_merienda_24.c"
-       
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_driver_gpio
@@ -26,4 +26,5 @@ idf_component_register(
         esp_psram
         esp_driver_spi
         esp_lcd
+        micro_wake_word
 )

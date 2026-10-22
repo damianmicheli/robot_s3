@@ -16,3 +16,4 @@ dependencies:
   #   public: true
   espressif/esp_lvgl_port: ^2.8.0
   espressif/led_strip: ^3.0.3
+  espressif/esp-tflite-micro: '*'

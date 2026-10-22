@@ -15,9 +15,9 @@
 #include "transcription.h"
 #include "speaker.h"
 #include "tts.h"
+#include "wake_word.h"
 
 static const char *TAG = "ROBOT";
-static const char *BUTTON_TAG = "BUTTON";
 
 void app_main(void)
 {
@@ -38,33 +38,58 @@ void app_main(void)
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(microphone_init());
     ESP_ERROR_CHECK(speaker_init());
+    ESP_ERROR_CHECK(wake_word_init());
 
     display_show_standby();
-    rgb_led_off();
+    /* Microfono encendido al inicio: LED en verde */
+    rgb_led_set_color(0, 255, 0);
     ESP_ERROR_CHECK(speaker_play_startup_tone());
 
     if (network_connect() != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi no conectado; se reintentara al enviar");
     }
 
-    ESP_LOGI(TAG, "Listo: STAND BY. Pulsa el boton para grabar 5 segundos.");
+    /* Inicia la escucha continua de la wake word "Hola Loki" */
+    wake_word_start();
+
+    ESP_LOGI(TAG, "Robot listo. Escuchando 'Hola Loki' (Boton = Silenciar/Activar microfono).");
 
     while (1)
     {
+        /* Gestion del boton fisico: Silenciar / Activar microfono */
         if (button_was_pressed())
         {
-            ESP_LOGI(BUTTON_TAG, "Grabacion iniciada");
+            wake_word_toggle_mute();
+            if (wake_word_is_muted()) {
+                /* Microfono apagado: LED apagado */
+                rgb_led_off();
+                ESP_LOGW(TAG, "Modo silencio activado (Microfono OFF)");
+            } else {
+                /* Microfono encendido: LED verde */
+                rgb_led_set_color(0, 255, 0);
+                display_show_standby();
+                ESP_LOGI(TAG, "Modo escucha activado (Microfono ON)");
+            }
+        }
+
+        /* Deteccion de la palabra de activacion "Hola Loki" */
+        if (!wake_word_is_muted() && wake_word_detected())
+        {
+            wake_word_clear_detected();
+            ESP_LOGI(TAG, "Activacion por voz: 'Hola Loki'");
+
+            /* Carita atenta y LED rojo de grabacion */
             display_show_recording();
             rgb_led_set_color(255, 0, 0);
 
-            /* Permite que LVGL dibuje ESCUCHANDO antes de iniciar la lectura I2S */
+            /* Graba 5 segundos la pregunta del usuario */
             vTaskDelay(pdMS_TO_TICKS(100));
             esp_err_t result = microphone_record_five_seconds();
             if (result != ESP_OK) {
                 ESP_LOGE(TAG, "Error durante la grabacion: %s", esp_err_to_name(result));
             }
 
-            /* Mientras procesa STT y Ollama, muestra la carita pensando con LED ambar */
+            /* Carita pensando y LED ambar mientras procesa STT y Ollama */
             display_show_thinking();
             rgb_led_set_color(255, 140, 0);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -88,9 +113,14 @@ void app_main(void)
                 }
             }
 
-            /* Regresa a reposo / stand by */
-            rgb_led_off();
+            /* Regresa a reposo y reanuda la escucha continua */
+            if (wake_word_is_muted()) {
+                rgb_led_off();
+            } else {
+                rgb_led_set_color(0, 255, 0);
+            }
             display_show_standby();
+            wake_word_start();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));

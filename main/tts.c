@@ -49,7 +49,7 @@ esp_err_t tts_speak(const char *text)
 
     const int length = snprintf(request, request_capacity,
         "{\"model\":\"" TTS_MODEL "\",\"input\":\"%s\",\"voice\":\"" TTS_VOICE
-        "\",\"response_format\":\"wav\"}", escaped);
+        "\",\"speed\":0.78,\"response_format\":\"wav\"}", escaped);
     heap_caps_free(escaped);
 
     if (length < 0 || (size_t)length >= request_capacity) {

@@ -13,15 +13,67 @@
 
 static const char *TAG = "OLLAMA";
 
-#define ESCAPED_USER_TEXT_SIZE 1024
-#define REQUEST_BUFFER_SIZE    2048
+#define MAX_CHAT_MESSAGES      14
+#define REQUEST_BUFFER_SIZE    8192
 #define RESPONSE_BUFFER_SIZE   16384
 #define LAST_ANSWER_CAPACITY   2048
 
+static const char *SYSTEM_PROMPT =
+    "Sos Bombón, una robot de escritorio amigable, inteligente y dulce. "
+    "Hablas en espanol argentino natural y conversacional. "
+    "Respuestas breves de maximo 2 oraciones cortas, directas para sintetizar por voz. "
+    "No uses listas, asteriscos ni emojis ya que tu respuesta sera sintetizada por voz. "
+    "IMPORTANTE: Si el usuario se despide (diciendo chau, hasta luego, nos vemos, adios, etc.), "
+    "responde despidiendote calidamente y agrega exactamente [CHAU] al final de tu respuesta. "
+    "Si no se esta despidiendo, NO agregues esa etiqueta.";
+
+typedef struct {
+    char role[12];
+    char *content;
+} chat_msg_t;
+
+static chat_msg_t s_messages[MAX_CHAT_MESSAGES];
+static int s_message_count = 0;
 static char s_last_answer[LAST_ANSWER_CAPACITY];
 
-/* Escapa el texto del usuario para insertarlo en el JSON de la peticion */
-static size_t json_escape_user_text(char *out, size_t capacity, const char *text)
+void llm_reset_conversation(void)
+{
+    for (int i = 0; i < s_message_count; i++) {
+        if (s_messages[i].content != NULL) {
+            free(s_messages[i].content);
+            s_messages[i].content = NULL;
+        }
+    }
+    s_message_count = 0;
+    s_last_answer[0] = '\0';
+}
+
+static void add_message(const char *role, const char *content)
+{
+    if (content == NULL) return;
+
+    if (s_message_count >= MAX_CHAT_MESSAGES) {
+        /* Descartar el par user/assistant mas antiguo (indices 1 y 2), preservando system en 0 */
+        if (s_message_count >= 3) {
+            free(s_messages[1].content);
+            free(s_messages[2].content);
+            for (int i = 1; i + 2 < s_message_count; i++) {
+                s_messages[i] = s_messages[i + 2];
+            }
+            s_message_count -= 2;
+        }
+    }
+
+    strncpy(s_messages[s_message_count].role, role, sizeof(s_messages[s_message_count].role) - 1);
+    s_messages[s_message_count].role[sizeof(s_messages[s_message_count].role) - 1] = '\0';
+    s_messages[s_message_count].content = strdup(content);
+    if (s_messages[s_message_count].content != NULL) {
+        s_message_count++;
+    }
+}
+
+/* Escapa el texto para insertarlo con seguridad en el JSON */
+static size_t json_escape_text(char *out, size_t capacity, const char *text)
 {
     size_t pos = 0;
     for (; *text && pos + 2 < capacity; text++) {
@@ -50,12 +102,11 @@ static bool extract_answer(const char *json, char *out, size_t out_capacity)
     if (text == NULL) return false;
     while (*++text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {}
     if (*text != '"') return false;
-    text++; /* Salta las comillas de apertura */
+    text++;
 
     size_t pos = 0;
     while (*text && pos + 1 < out_capacity) {
         if (*text == '"') {
-            /* Comilla de cierre sin escapar: fin del mensaje */
             break;
         }
         if (*text == '\\') {
@@ -70,7 +121,6 @@ static bool extract_answer(const char *json, char *out, size_t out_capacity)
                 out[pos++] = ' ';
                 text++;
             } else if (*text == 'u' && text[1] && text[2] && text[3] && text[4]) {
-                /* Secuencia unicode \uXXXX; saltamos el prefijo para no corromper */
                 text += 5;
             } else if (*text) {
                 out[pos++] = *text++;
@@ -85,37 +135,105 @@ static bool extract_answer(const char *json, char *out, size_t out_capacity)
     return pos > 0;
 }
 
-esp_err_t llm_answer(const char *user_text)
+/* Comprueba si el texto contiene palabras clave comunes de despedida */
+static bool contains_farewell_keyword(const char *text)
 {
-    char *escaped = heap_caps_malloc(ESCAPED_USER_TEXT_SIZE, MALLOC_CAP_8BIT);
-    char *request = heap_caps_malloc(REQUEST_BUFFER_SIZE, MALLOC_CAP_8BIT);
-    char *response = heap_caps_calloc(1, RESPONSE_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (response == NULL) {
-        response = heap_caps_calloc(1, 8192, MALLOC_CAP_8BIT);
+    if (text == NULL) return false;
+    char lower[256];
+    size_t len = strlen(text);
+    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = text[i];
+        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+        lower[i] = c;
+    }
+    lower[len] = '\0';
+
+    if (strstr(lower, "chau") != NULL ||
+        strstr(lower, "chao") != NULL ||
+        strstr(lower, "adios") != NULL ||
+        strstr(lower, "adiós") != NULL ||
+        strstr(lower, "hasta luego") != NULL ||
+        strstr(lower, "nos vemos") != NULL ||
+        strstr(lower, "hasta mañana") != NULL ||
+        strstr(lower, "hasta pronto") != NULL ||
+        strstr(lower, "me voy") != NULL ||
+        strstr(lower, "bye") != NULL) {
+        return true;
+    }
+    return false;
+}
+
+/* Detecta y elimina la etiqueta [CHAU] de la respuesta del LLM */
+static bool process_farewell(char *answer, const char *user_input)
+{
+    bool farewell = false;
+
+    char *tag = strstr(answer, "[CHAU]");
+    if (tag != NULL) {
+        farewell = true;
+        *tag = '\0';
+        int len = (int)strlen(answer);
+        while (len > 0 && ((unsigned char)answer[len - 1] <= 32)) {
+            answer[--len] = '\0';
+        }
     }
 
-    if (escaped == NULL || request == NULL || response == NULL) {
-        free(escaped);
-        free(request);
-        free(response);
+    if (!farewell && user_input != NULL && contains_farewell_keyword(user_input)) {
+        farewell = true;
+    }
+
+    return farewell;
+}
+
+static esp_err_t perform_chat_request(bool *out_is_farewell, const char *user_input)
+{
+    char *request = heap_caps_malloc(REQUEST_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *response = heap_caps_calloc(1, RESPONSE_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (request == NULL || response == NULL) {
+        if (request) free(request);
+        if (response) free(response);
         return ESP_ERR_NO_MEM;
     }
 
-    json_escape_user_text(escaped, ESCAPED_USER_TEXT_SIZE, user_text);
+    size_t offset = 0;
+    offset += snprintf(request + offset, REQUEST_BUFFER_SIZE - offset,
+                       "{\"model\":\"" OLLAMA_MODEL "\",\"messages\":[");
 
-    const int length = snprintf(request, REQUEST_BUFFER_SIZE,
-        "{\"model\":\"" OLLAMA_MODEL "\",\"messages\":["
-        "{\"role\":\"system\",\"content\":\"Sos un robot de escritorio amigable. Responde en espanol argentino, de forma natural, breve y conversacional. Maximo 2 o 3 oraciones cortas. No uses listas, asteriscos ni emojis ya que tu respuesta sera sintetizada por voz.\"},"
-        "{\"role\":\"user\",\"content\":\"%s\"}"
-        "],\"think\":false,\"stream\":false,\"options\":{\"num_ctx\":4096,\"temperature\":0.7}}",
-        escaped);
+    for (int i = 0; i < s_message_count; i++) {
+        size_t esc_len = strlen(s_messages[i].content) * 2 + 16;
+        char *escaped = heap_caps_malloc(esc_len, MALLOC_CAP_8BIT);
+        if (escaped == NULL) {
+            free(request);
+            free(response);
+            return ESP_ERR_NO_MEM;
+        }
+        json_escape_text(escaped, esc_len, s_messages[i].content);
 
-    if (length < 0 || length >= REQUEST_BUFFER_SIZE) {
+        int written = snprintf(request + offset, REQUEST_BUFFER_SIZE - offset,
+                               "%s{\"role\":\"%s\",\"content\":\"%s\"}",
+                               (i > 0) ? "," : "",
+                               s_messages[i].role,
+                               escaped);
         free(escaped);
+
+        if (written < 0 || (size_t)written >= REQUEST_BUFFER_SIZE - offset) {
+            free(request);
+            free(response);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        offset += written;
+    }
+
+    int closing = snprintf(request + offset, REQUEST_BUFFER_SIZE - offset,
+                           "],\"think\":false,\"stream\":false,\"options\":{\"num_ctx\":4096,\"temperature\":0.75}}");
+    if (closing < 0 || (size_t)closing >= REQUEST_BUFFER_SIZE - offset) {
         free(request);
         free(response);
         return ESP_ERR_INVALID_SIZE;
     }
+    offset += closing;
 
     const esp_http_client_config_t config = {
         .url = OLLAMA_CHAT_URL,
@@ -126,15 +244,14 @@ esp_err_t llm_answer(const char *user_text)
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
-        free(escaped);
         free(request);
         free(response);
         return ESP_ERR_NO_MEM;
     }
 
     esp_err_t err = esp_http_client_set_header(client, "Content-Type", "application/json");
-    if (err == ESP_OK) err = esp_http_client_open(client, length);
-    if (err == ESP_OK && esp_http_client_write(client, request, length) != length) err = ESP_FAIL;
+    if (err == ESP_OK) err = esp_http_client_open(client, (int)offset);
+    if (err == ESP_OK && esp_http_client_write(client, request, (int)offset) != (int)offset) err = ESP_FAIL;
     if (err == ESP_OK) esp_http_client_fetch_headers(client);
 
     const int status = esp_http_client_get_status_code(client);
@@ -160,7 +277,6 @@ esp_err_t llm_answer(const char *user_text)
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    free(escaped);
     free(request);
 
     if (err != ESP_OK) {
@@ -179,9 +295,54 @@ esp_err_t llm_answer(const char *user_text)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Respuesta: %s", s_last_answer);
     free(response);
+
+    bool is_farewell = process_farewell(s_last_answer, user_input);
+    if (out_is_farewell != NULL) {
+        *out_is_farewell = is_farewell;
+    }
+
+    ESP_LOGI(TAG, "Respuesta LLM: %s %s", s_last_answer, is_farewell ? "[DESPEDIDA]" : "");
+
+    /* Guardar en el historial de la conversacion */
+    add_message("assistant", s_last_answer);
+
     return ESP_OK;
+}
+
+/*
+ * Genera el saludo inicial en tiempo real (dinamico, no pre-seteado).
+ */
+esp_err_t llm_generate_greeting(void)
+{
+    llm_reset_conversation();
+    add_message("system", SYSTEM_PROMPT);
+    add_message("user", "Hola Bombon");
+
+    bool dummy = false;
+    return perform_chat_request(&dummy, "Hola Bombon");
+}
+
+/*
+ * Envia el turno del usuario dentro de la conversacion fluida continua.
+ */
+esp_err_t llm_chat(const char *user_text, bool *out_is_farewell)
+{
+    if (user_text == NULL || *user_text == '\0') return ESP_ERR_INVALID_ARG;
+    if (out_is_farewell != NULL) *out_is_farewell = false;
+
+    if (s_message_count == 0) {
+        add_message("system", SYSTEM_PROMPT);
+    }
+
+    add_message("user", user_text);
+    return perform_chat_request(out_is_farewell, user_text);
+}
+
+esp_err_t llm_answer(const char *user_text)
+{
+    bool dummy = false;
+    return llm_chat(user_text, &dummy);
 }
 
 const char *llm_get_last_answer(void)

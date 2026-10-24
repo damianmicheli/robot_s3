@@ -19,6 +19,39 @@
 
 static const char *TAG = "ROBOT";
 
+static bool check_button_abort(void)
+{
+    if (button_was_pressed()) {
+        wake_word_toggle_mute();
+        return true;
+    }
+    return false;
+}
+
+static bool is_empty_or_silence(const char *text)
+{
+    if (text == NULL) return true;
+    while (*text && (unsigned char)*text <= 32) text++;
+    if (*text == '\0') return true;
+
+    /* Ignora anotaciones entre corchetes o parentesis como [musica] */
+    if (*text == '[' || *text == '(') {
+        const char *end = text + strlen(text) - 1;
+        while (end > text && (unsigned char)*end <= 32) end--;
+        if (*end == ']' || *end == ')') return true;
+    }
+
+    bool has_alnum = false;
+    for (const char *p = text; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c > 32 && c != '.' && c != ',' && c != '!' && c != '?' && c != '-' && c != ';' && c != ':') {
+            has_alnum = true;
+            break;
+        }
+    }
+    return !has_alnum;
+}
+
 void app_main(void)
 {
     uint32_t flash_size = 0;
@@ -49,10 +82,10 @@ void app_main(void)
         ESP_LOGW(TAG, "Wi-Fi no conectado; se reintentara al enviar");
     }
 
-    /* Inicia la escucha continua de la wake word "Hola Loki" */
+    /* Inicia la escucha continua de la wake word "Hola Bombon" */
     wake_word_start();
 
-    ESP_LOGI(TAG, "Robot listo. Escuchando 'Hola Loki' (Boton = Silenciar/Activar microfono).");
+    ESP_LOGI(TAG, "Robot listo. Escuchando 'Hola Bombon' (Boton = Silenciar/Activar microfono).");
 
     while (1)
     {
@@ -72,45 +105,99 @@ void app_main(void)
             }
         }
 
-        /* Deteccion de la palabra de activacion "Hola Loki" */
+        /* Deteccion de la palabra de activacion "Hola Bombon" */
         if (!wake_word_is_muted() && wake_word_detected())
         {
             wake_word_clear_detected();
-            ESP_LOGI(TAG, "Activacion por voz: 'Hola Loki'");
+            wake_word_stop();
+            ESP_LOGI(TAG, "Activacion por voz: 'Hola Bombon'. Iniciando conversacion fluida.");
 
-            /* Carita atenta y LED rojo de grabacion */
-            display_show_recording();
-            rgb_led_set_color(255, 0, 0);
-
-            /* Graba 5 segundos la pregunta del usuario */
-            vTaskDelay(pdMS_TO_TICKS(100));
-            esp_err_t result = microphone_record_five_seconds();
-            if (result != ESP_OK) {
-                ESP_LOGE(TAG, "Error durante la grabacion: %s", esp_err_to_name(result));
-            }
-
-            /* Carita pensando y LED ambar mientras procesa STT y Ollama */
+            /* 1. Paso 3: Generar y responder el saludo en el momento (no pre-seteado) */
             display_show_thinking();
             rgb_led_set_color(255, 140, 0);
-            vTaskDelay(pdMS_TO_TICKS(100));
 
-            if (result == ESP_OK) {
-                result = network_connect();
-                if (result == ESP_OK) {
-                    result = transcription_send_last_recording();
+            esp_err_t res = network_connect();
+            if (res == ESP_OK) {
+                res = llm_generate_greeting();
+            }
+            if (res == ESP_OK) {
+                display_show_speaking();
+                rgb_led_set_color(0, 180, 255);
+                res = tts_speak(llm_get_last_answer());
+            } else {
+                ESP_LOGE(TAG, "No se pudo generar el saludo inicial: %s", esp_err_to_name(res));
+            }
+
+            /* 2. Ciclo de conversacion fluida:
+             *    4. Escucha la respuesta del usuario por 30 segundos
+             *    5. El usuario responde
+             *    6. El robot vuelve a responder
+             *    7. Vuelve al punto 4 hasta frase de despedida o 30 segundos de silencio.
+             */
+            bool conversation_active = (res == ESP_OK);
+
+            while (conversation_active && !wake_word_is_muted())
+            {
+                /* 4. Se queda escuchando respuesta por 30 segundos (con deteccion VAD) */
+                display_show_recording();
+                rgb_led_set_color(255, 0, 0);
+
+                bool heard_speech = false;
+                res = microphone_listen_and_record(30, 20, check_button_abort, &heard_speech);
+
+                if (wake_word_is_muted()) {
+                    conversation_active = false;
+                    break;
                 }
-                if (result == ESP_OK) {
-                    result = llm_answer(transcription_get_last_text());
+
+                if (res != ESP_OK || !heard_speech) {
+                    /* Condicion de salida: silencio por 30 segundos */
+                    ESP_LOGI(TAG, "Conversacion finalizada por inactividad (30s en silencio).");
+                    conversation_active = false;
+                    break;
                 }
-                if (result == ESP_OK) {
-                    /* Carita hablando con boca animada y LED cian */
+
+                /* 5. El usuario respondio: Transcribir el audio grabado */
+                display_show_thinking();
+                rgb_led_set_color(255, 140, 0);
+
+                res = network_connect();
+                if (res == ESP_OK) {
+                    res = transcription_send_last_recording();
+                }
+
+                if (res != ESP_OK) {
+                    ESP_LOGW(TAG, "Error durante la transcripcion: %s", esp_err_to_name(res));
+                    continue;
+                }
+
+                const char *user_text = transcription_get_last_text();
+                if (user_text == NULL || is_empty_or_silence(user_text)) {
+                    ESP_LOGI(TAG, "Audio sin palabras reconocibles. Continuando escucha...");
+                    continue;
+                }
+
+                ESP_LOGI(TAG, "Usuario dijo: \"%s\"", user_text);
+
+                /* 6. Me vuelve a responder con Ollama y TTS */
+                bool is_farewell = false;
+                res = llm_chat(user_text, &is_farewell);
+                if (res == ESP_OK) {
                     display_show_speaking();
                     rgb_led_set_color(0, 180, 255);
-                    result = tts_speak(llm_get_last_answer());
+                    tts_speak(llm_get_last_answer());
+                } else {
+                    ESP_LOGE(TAG, "Error en LLM: %s", esp_err_to_name(res));
                 }
-                if (result != ESP_OK) {
-                    ESP_LOGE(TAG, "No se pudo completar la consulta: %s", esp_err_to_name(result));
+
+                /* 7. Condicion de salida: frase de despedida */
+                if (is_farewell) {
+                    ESP_LOGI(TAG, "Frase de despedida detectada. Finalizando conversacion.");
+                    conversation_active = false;
+                    break;
                 }
+
+                /* Vuelve al punto 4 */
             }
 
             /* Regresa a reposo y reanuda la escucha continua */
@@ -118,8 +205,8 @@ void app_main(void)
                 rgb_led_off();
             } else {
                 rgb_led_set_color(0, 255, 0);
+                display_show_standby();
             }
-            display_show_standby();
             wake_word_start();
         }
 

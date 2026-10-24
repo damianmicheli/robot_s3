@@ -1,32 +1,69 @@
 #include "microphone.h"
 
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/i2s_common.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* Conexiones INMP441: SCK=16, WS=17, SD=18 y L/R a GND (canal izquierdo). */
-#define INMP441_BCLK_GPIO      GPIO_NUM_16
-#define INMP441_WS_GPIO        GPIO_NUM_17
-#define INMP441_DATA_GPIO      GPIO_NUM_18
-#define INMP441_SAMPLE_RATE_HZ 16000
-#define INMP441_RECORD_SECONDS 5
-#define INMP441_CHANNELS       2
-#define INMP441_BUFFER_WORDS   256
+#define INMP441_BCLK_GPIO          GPIO_NUM_16
+#define INMP441_WS_GPIO            GPIO_NUM_17
+#define INMP441_DATA_GPIO          GPIO_NUM_18
+#define INMP441_SAMPLE_RATE_HZ     16000
+#define INMP441_MAX_RECORD_SECONDS 30
+#define INMP441_CHANNELS           2
+#define INMP441_BUFFER_WORDS       256
 
+/* Parametros de deteccion de actividad de voz (VAD) */
+#define VAD_CHUNK_SAMPLES          800   /* 50 ms a 16 kHz */
+#define VAD_PREROLL_CHUNKS         10    /* 10 chunks x 50 ms = 500 ms de pre-roll */
+#define VAD_SILENCE_TIMEOUT_MS     1300  /* 1.3 s de silencio para cerrar la frase */
+
+static const char *TAG = "MIC";
 static i2s_chan_handle_t s_rx_channel;
-static int16_t *s_recording;
-static size_t s_recording_samples;
+static int16_t *s_recording = NULL;
+static int16_t *s_preroll = NULL;
+static size_t s_recording_samples = 0;
 static bool s_stream_enabled = false;
+
+/* Calcula el nivel medio de energia de la senal (desviacion media absoluta sin DC) */
+static uint32_t calculate_chunk_energy(const int16_t *buf, size_t count)
+{
+    if (count == 0) return 0;
+    int32_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sum += buf[i];
+    }
+    int32_t mean = sum / (int32_t)count;
+
+    uint32_t abs_diff_sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t diff = (int32_t)buf[i] - mean;
+        abs_diff_sum += (diff < 0) ? -diff : diff;
+    }
+    return abs_diff_sum / count;
+}
 
 esp_err_t microphone_init(void)
 {
-    /* Cinco segundos de PCM 16-bit mono ocupan 160 KB en PSRAM */
-    s_recording = heap_caps_malloc(INMP441_SAMPLE_RATE_HZ * INMP441_RECORD_SECONDS *
+    /* 30 segundos de PCM 16-bit mono ocupan 960 KB en PSRAM */
+    s_recording = heap_caps_malloc(INMP441_SAMPLE_RATE_HZ * INMP441_MAX_RECORD_SECONDS *
                                    sizeof(*s_recording), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_recording == NULL) return ESP_ERR_NO_MEM;
+
+    s_preroll = heap_caps_malloc(VAD_CHUNK_SAMPLES * VAD_PREROLL_CHUNKS *
+                                 sizeof(*s_preroll), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_preroll == NULL) {
+        heap_caps_free(s_recording);
+        s_recording = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
     const i2s_chan_config_t channel_config =
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -48,9 +85,9 @@ esp_err_t microphone_init(void)
         },
     };
 
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_config, NULL, &s_rx_channel), "MIC",
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_config, NULL, &s_rx_channel), TAG,
                         "No se pudo crear el canal I2S");
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx_channel, &i2s_config), "MIC",
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx_channel, &i2s_config), TAG,
                         "No se pudo configurar el INMP441");
     return ESP_OK;
 }
@@ -105,12 +142,144 @@ size_t microphone_read_pcm(int16_t *buf, size_t samples_wanted)
     return samples_collected;
 }
 
+/*
+ * Escucha la respuesta del usuario con deteccion inteligente de voz (VAD):
+ * - Espera hasta max_wait_sec (ej. 30 s) a que el usuario empiece a hablar.
+ * - Mantiene un buffer circular de pre-roll (500 ms) para no recortar la primera silaba.
+ * - Una vez iniciada la voz, graba hasta que detecta 1.3 s de silencio o max_speech_sec.
+ * - Si pasan max_wait_sec en silencio absoluto, termina y devuelve *out_heard_speech = false.
+ */
+esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
+                                       uint32_t max_speech_sec,
+                                       bool (*abort_check)(void),
+                                       bool *out_heard_speech)
+{
+    if (out_heard_speech == NULL) return ESP_ERR_INVALID_ARG;
+    *out_heard_speech = false;
+    s_recording_samples = 0;
+
+    ESP_RETURN_ON_ERROR(microphone_start_stream(), TAG, "No se pudo iniciar I2S");
+
+    int preroll_head = 0;
+    int preroll_count = 0;
+    bool speech_started = false;
+    int consecutive_speech_chunks = 0;
+    uint32_t consecutive_silence_ms = 0;
+    uint32_t elapsed_wait_ms = 0;
+    uint32_t speech_duration_ms = 0;
+    uint32_t ambient_noise = 120;
+    const uint32_t max_wait_ms = max_wait_sec * 1000;
+    const uint32_t max_speech_ms = max_speech_sec * 1000;
+    const uint32_t max_total_samples = INMP441_SAMPLE_RATE_HZ * INMP441_MAX_RECORD_SECONDS;
+
+    int16_t chunk[VAD_CHUNK_SAMPLES];
+
+    while (1) {
+        if (abort_check && abort_check()) {
+            ESP_LOGI(TAG, "Escucha abortada por usuario");
+            microphone_stop_stream();
+            s_recording_samples = 0;
+            *out_heard_speech = false;
+            return ESP_OK;
+        }
+
+        size_t read_samples = microphone_read_pcm(chunk, VAD_CHUNK_SAMPLES);
+        if (read_samples < VAD_CHUNK_SAMPLES) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        uint32_t energy = calculate_chunk_energy(chunk, VAD_CHUNK_SAMPLES);
+
+        if (!speech_started) {
+            elapsed_wait_ms += 50;
+
+            /* Adaptar nivel de ruido de fondo */
+            if (energy < ambient_noise) {
+                ambient_noise = (ambient_noise * 7 + energy) / 8;
+            } else if (energy < ambient_noise * 2) {
+                ambient_noise = (ambient_noise * 31 + energy) / 32;
+            }
+
+            uint32_t speech_threshold = ambient_noise * 2 + 250;
+            if (speech_threshold < 400) speech_threshold = 400;
+
+            /* Guardar en buffer circular de pre-roll */
+            memcpy(s_preroll + (preroll_head * VAD_CHUNK_SAMPLES), chunk, sizeof(chunk));
+            preroll_head = (preroll_head + 1) % VAD_PREROLL_CHUNKS;
+            if (preroll_count < VAD_PREROLL_CHUNKS) preroll_count++;
+
+            if (energy >= speech_threshold) {
+                consecutive_speech_chunks++;
+                if (consecutive_speech_chunks >= 2) {
+                    speech_started = true;
+                    ESP_LOGI(TAG, "Voz detectada! (energia=%lu, umbral=%lu, ruido=%lu)",
+                             (unsigned long)energy, (unsigned long)speech_threshold, (unsigned long)ambient_noise);
+
+                    /* Volcar el pre-roll en orden cronológico en s_recording */
+                    size_t copied = 0;
+                    int start_idx = (preroll_count < VAD_PREROLL_CHUNKS) ? 0 : preroll_head;
+                    for (int i = 0; i < preroll_count; i++) {
+                        int c_idx = (start_idx + i) % VAD_PREROLL_CHUNKS;
+                        memcpy(s_recording + copied, s_preroll + (c_idx * VAD_CHUNK_SAMPLES),
+                               VAD_CHUNK_SAMPLES * sizeof(int16_t));
+                        copied += VAD_CHUNK_SAMPLES;
+                    }
+                    s_recording_samples = copied;
+                    consecutive_silence_ms = 0;
+                }
+            } else {
+                consecutive_speech_chunks = 0;
+            }
+
+            if (!speech_started && elapsed_wait_ms >= max_wait_ms) {
+                ESP_LOGI(TAG, "Silencio continuo por %lu s. Finalizando escucha.", (unsigned long)max_wait_sec);
+                microphone_stop_stream();
+                s_recording_samples = 0;
+                *out_heard_speech = false;
+                return ESP_OK;
+            }
+        } else {
+            speech_duration_ms += 50;
+
+            if (s_recording_samples + VAD_CHUNK_SAMPLES <= max_total_samples) {
+                memcpy(s_recording + s_recording_samples, chunk, sizeof(chunk));
+                s_recording_samples += VAD_CHUNK_SAMPLES;
+            }
+
+            uint32_t speech_threshold = ambient_noise * 2 + 200;
+            if (speech_threshold < 350) speech_threshold = 350;
+
+            if (energy >= speech_threshold) {
+                consecutive_silence_ms = 0;
+            } else {
+                consecutive_silence_ms += 50;
+            }
+
+            if (consecutive_silence_ms >= VAD_SILENCE_TIMEOUT_MS) {
+                ESP_LOGI(TAG, "Fin de frase detectado (%lu ms de voz, %u muestras grabadas)",
+                         (unsigned long)speech_duration_ms, (unsigned int)s_recording_samples);
+                microphone_stop_stream();
+                *out_heard_speech = true;
+                return ESP_OK;
+            }
+
+            if (speech_duration_ms >= max_speech_ms) {
+                ESP_LOGI(TAG, "Limite de duracion de frase alcanzado (%lu ms)", (unsigned long)speech_duration_ms);
+                microphone_stop_stream();
+                *out_heard_speech = true;
+                return ESP_OK;
+            }
+        }
+    }
+}
+
 esp_err_t microphone_record_five_seconds(void)
 {
-    const uint32_t target_samples = INMP441_SAMPLE_RATE_HZ * INMP441_RECORD_SECONDS;
+    const uint32_t target_samples = INMP441_SAMPLE_RATE_HZ * 5;
     uint32_t frame_count = 0;
 
-    ESP_RETURN_ON_ERROR(microphone_start_stream(), "MIC", "No se pudo iniciar I2S");
+    ESP_RETURN_ON_ERROR(microphone_start_stream(), TAG, "No se pudo iniciar I2S");
 
     while (frame_count < target_samples) {
         size_t needed = target_samples - frame_count;

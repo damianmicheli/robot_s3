@@ -6,7 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "hola_loki_model.h"
+#include "hola_bombon_model.h"
 #include "microphone.h"
 
 #include "esphome/components/microphone/microphone.h"
@@ -72,14 +72,14 @@ esp_err_t wake_word_init(void) {
      * - Modelo TFLite en Flash
      * - Umbral de probabilidad: 0.80f (80%)
      * - Ventana deslizante para promedio: 5 pasos
-     * - Nombre: "Hola Loki"
+     * - Nombre: "Hola Bombon"
      * - Arena de tensores: 64 KB (asignada en PSRAM)
      */
     s_wake_word.add_wake_word_model(
-        hola_loki_tflite,
+        hola_bombon_tflite,
         0.80f,
         5,
-        "Hola Loki",
+        "Hola Bombon",
         64 * 1024
     );
     s_wake_word.set_features_step_size(10);
@@ -102,7 +102,7 @@ esp_err_t wake_word_init(void) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Motor microWakeWord inicializado con modelo 'Hola Loki'");
+    ESP_LOGI(TAG, "Motor microWakeWord inicializado con modelo 'Hola Bombon'");
     return ESP_OK;
 }
 
@@ -111,7 +111,7 @@ void wake_word_start(void) {
     s_detected = false;
     s_listening = true;
     s_wake_word.start();
-    ESP_LOGI(TAG, "Escucha continua activada para 'Hola Loki'");
+    ESP_LOGI(TAG, "Escucha continua activada para 'Hola Bombon'");
 }
 
 void wake_word_stop(void) {
@@ -134,7 +134,7 @@ void wake_word_toggle_mute(void) {
         wake_word_stop();
         ESP_LOGW(TAG, "Microfono SILENCIADO (MUTE). El robot no escuchara.");
     } else {
-        ESP_LOGI(TAG, "Microfono ACTIVADO (UNMUTE). Escuchando 'Hola Loki'...");
+        ESP_LOGI(TAG, "Microfono ACTIVADO (UNMUTE). Escuchando 'Hola Bombon'...");
         wake_word_start();
     }
 }

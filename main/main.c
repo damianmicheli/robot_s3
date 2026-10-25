@@ -135,9 +135,13 @@ void app_main(void)
              *    7. Vuelve al punto 4 hasta frase de despedida o 30 segundos de silencio.
              */
             bool conversation_active = (res == ESP_OK);
+            int consecutive_unrecognized = 0;
 
             while (conversation_active && !wake_word_is_muted())
             {
+                /* Pausa breve tras sintetizador para asegurar silencio acustico en sala */
+                vTaskDelay(pdMS_TO_TICKS(150));
+
                 /* 4. Se queda escuchando respuesta por 30 segundos (con deteccion VAD) */
                 display_show_recording();
                 rgb_led_set_color(255, 0, 0);
@@ -173,10 +177,18 @@ void app_main(void)
 
                 const char *user_text = transcription_get_last_text();
                 if (user_text == NULL || is_empty_or_silence(user_text)) {
-                    ESP_LOGI(TAG, "Audio sin palabras reconocibles. Continuando escucha...");
+                    consecutive_unrecognized++;
+                    ESP_LOGI(TAG, "Audio sin palabras reconocibles (%d/3). Continuando escucha...",
+                             consecutive_unrecognized);
+                    if (consecutive_unrecognized >= 3) {
+                        ESP_LOGI(TAG, "Demasiados intentos sin palabras reconocibles. Finalizando conversacion.");
+                        conversation_active = false;
+                        break;
+                    }
                     continue;
                 }
 
+                consecutive_unrecognized = 0;
                 ESP_LOGI(TAG, "Usuario dijo: \"%s\"", user_text);
 
                 /* 6. Me vuelve a responder con Ollama y TTS */
@@ -201,6 +213,7 @@ void app_main(void)
             }
 
             /* Regresa a reposo y reanuda la escucha continua */
+            microphone_stop_stream();
             if (wake_word_is_muted()) {
                 rgb_led_off();
             } else {

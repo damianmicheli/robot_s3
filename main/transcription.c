@@ -43,7 +43,9 @@ esp_err_t transcription_send_last_recording(void)
         .data_size = (uint32_t)data_size,
     };
     const char preamble[] = "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\nContent-Type: audio/wav\r\n\r\n";
-    const char ending[] = "\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" TRANSCRIPTION_MODEL "\r\n--" BOUNDARY "--\r\n";
+    const char ending[] = "\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" TRANSCRIPTION_MODEL
+                          "\r\n--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nes"
+                          "\r\n--" BOUNDARY "--\r\n";
     char content_type[80];
     snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", BOUNDARY);
     const esp_http_client_config_t cfg = {

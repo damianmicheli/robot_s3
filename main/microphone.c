@@ -108,6 +108,29 @@ esp_err_t microphone_stop_stream(void)
     return err;
 }
 
+void microphone_flush(void)
+{
+    if (!s_stream_enabled) return;
+    int32_t raw_samples[INMP441_BUFFER_WORDS];
+    size_t bytes_read = 0;
+    while (i2s_channel_read(s_rx_channel, raw_samples, sizeof(raw_samples), &bytes_read, 0) == ESP_OK && bytes_read > 0) {
+        /* vaciando descriptores DMA */
+    }
+}
+
+void microphone_discard_samples(uint32_t ms)
+{
+    if (!s_stream_enabled) return;
+    size_t total_samples_to_discard = (INMP441_SAMPLE_RATE_HZ * ms) / 1000;
+    int16_t dummy[VAD_CHUNK_SAMPLES];
+    while (total_samples_to_discard > 0) {
+        size_t chunk_size = total_samples_to_discard > VAD_CHUNK_SAMPLES ? VAD_CHUNK_SAMPLES : total_samples_to_discard;
+        size_t read = microphone_read_pcm(dummy, chunk_size);
+        if (read == 0) break;
+        total_samples_to_discard -= read;
+    }
+}
+
 size_t microphone_read_pcm(int16_t *buf, size_t samples_wanted)
 {
     if (!s_stream_enabled) {
@@ -158,7 +181,16 @@ esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
     *out_heard_speech = false;
     s_recording_samples = 0;
 
+    bool newly_started = !s_stream_enabled;
     ESP_RETURN_ON_ERROR(microphone_start_stream(), TAG, "No se pudo iniciar I2S");
+
+    if (newly_started) {
+        /* Descartar 350 ms de transitorio de encendido / carga de filtro del INMP441 */
+        microphone_discard_samples(350);
+    } else {
+        /* Si el micro ya estaba activo, descartar muestras viejas acumuladas en DMA */
+        microphone_flush();
+    }
 
     int preroll_head = 0;
     int preroll_count = 0;
@@ -167,12 +199,35 @@ esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
     uint32_t consecutive_silence_ms = 0;
     uint32_t elapsed_wait_ms = 0;
     uint32_t speech_duration_ms = 0;
-    uint32_t ambient_noise = 120;
+    uint32_t active_speech_ms = 0;
     const uint32_t max_wait_ms = max_wait_sec * 1000;
     const uint32_t max_speech_ms = max_speech_sec * 1000;
     const uint32_t max_total_samples = INMP441_SAMPLE_RATE_HZ * INMP441_MAX_RECORD_SECONDS;
 
     int16_t chunk[VAD_CHUNK_SAMPLES];
+
+    /* Calibrar ruido ambiente real de la habitacion con 4 chunks (200 ms) */
+    uint32_t noise_sum = 0;
+    int noise_chunks = 0;
+    for (int i = 0; i < 4; i++) {
+        if (abort_check && abort_check()) {
+            microphone_stop_stream();
+            s_recording_samples = 0;
+            *out_heard_speech = false;
+            return ESP_OK;
+        }
+        size_t r = microphone_read_pcm(chunk, VAD_CHUNK_SAMPLES);
+        if (r == VAD_CHUNK_SAMPLES) {
+            noise_sum += calculate_chunk_energy(chunk, VAD_CHUNK_SAMPLES);
+            noise_chunks++;
+        }
+    }
+    uint32_t ambient_noise = (noise_chunks > 0) ? (noise_sum / noise_chunks) : 120;
+    if (ambient_noise < 80) ambient_noise = 80;
+    if (ambient_noise > 800) ambient_noise = 800;
+
+    uint32_t speech_threshold = ambient_noise * 2 + 250;
+    if (speech_threshold < 450) speech_threshold = 450;
 
     while (1) {
         if (abort_check && abort_check()) {
@@ -194,15 +249,15 @@ esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
         if (!speech_started) {
             elapsed_wait_ms += 50;
 
-            /* Adaptar nivel de ruido de fondo */
+            /* Adaptar nivel de ruido de fondo ante cambios graduales */
             if (energy < ambient_noise) {
                 ambient_noise = (ambient_noise * 7 + energy) / 8;
-            } else if (energy < ambient_noise * 2) {
+            } else if (energy < speech_threshold) {
                 ambient_noise = (ambient_noise * 31 + energy) / 32;
             }
 
-            uint32_t speech_threshold = ambient_noise * 2 + 250;
-            if (speech_threshold < 400) speech_threshold = 400;
+            speech_threshold = ambient_noise * 2 + 250;
+            if (speech_threshold < 450) speech_threshold = 450;
 
             /* Guardar en buffer circular de pre-roll */
             memcpy(s_preroll + (preroll_head * VAD_CHUNK_SAMPLES), chunk, sizeof(chunk));
@@ -211,12 +266,14 @@ esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
 
             if (energy >= speech_threshold) {
                 consecutive_speech_chunks++;
-                if (consecutive_speech_chunks >= 2) {
+                /* Requiere al menos 3 chunks (150 ms) para descartar chasquidos y transitorios breves */
+                if (consecutive_speech_chunks >= 3) {
                     speech_started = true;
+                    active_speech_ms = consecutive_speech_chunks * 50;
                     ESP_LOGI(TAG, "Voz detectada! (energia=%lu, umbral=%lu, ruido=%lu)",
                              (unsigned long)energy, (unsigned long)speech_threshold, (unsigned long)ambient_noise);
 
-                    /* Volcar el pre-roll en orden cronológico en s_recording */
+                    /* Volcar el pre-roll en orden cronologico en s_recording */
                     size_t copied = 0;
                     int start_idx = (preroll_count < VAD_PREROLL_CHUNKS) ? 0 : preroll_head;
                     for (int i = 0; i < preroll_count; i++) {
@@ -227,6 +284,7 @@ esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
                     }
                     s_recording_samples = copied;
                     consecutive_silence_ms = 0;
+                    speech_duration_ms = 0;
                 }
             } else {
                 consecutive_speech_chunks = 0;
@@ -247,26 +305,47 @@ esp_err_t microphone_listen_and_record(uint32_t max_wait_sec,
                 s_recording_samples += VAD_CHUNK_SAMPLES;
             }
 
-            uint32_t speech_threshold = ambient_noise * 2 + 200;
-            if (speech_threshold < 350) speech_threshold = 350;
+            uint32_t speech_threshold_active = ambient_noise * 2 + 200;
+            if (speech_threshold_active < 380) speech_threshold_active = 380;
 
-            if (energy >= speech_threshold) {
+            if (energy >= speech_threshold_active) {
+                active_speech_ms += 50;
                 consecutive_silence_ms = 0;
             } else {
                 consecutive_silence_ms += 50;
             }
 
             if (consecutive_silence_ms >= VAD_SILENCE_TIMEOUT_MS) {
-                ESP_LOGI(TAG, "Fin de frase detectado (%lu ms de voz, %u muestras grabadas)",
-                         (unsigned long)speech_duration_ms, (unsigned int)s_recording_samples);
-                microphone_stop_stream();
+                /* Si el audio activo total fue menor a 250 ms, se descarta como ruido / chasquido */
+                if (active_speech_ms < 250) {
+                    ESP_LOGI(TAG, "Ruido breve descartado (%lu ms de audio activo). Continuando escucha...",
+                             (unsigned long)active_speech_ms);
+                    speech_started = false;
+                    s_recording_samples = 0;
+                    preroll_count = 0;
+                    preroll_head = 0;
+                    consecutive_speech_chunks = 0;
+                    consecutive_silence_ms = 0;
+                    active_speech_ms = 0;
+                    speech_duration_ms = 0;
+                    continue;
+                }
+
+                /* Recortar el exceso de silencio final para optimizar el envio (dejar ~400 ms de cola) */
+                uint32_t excess_silence_ms = consecutive_silence_ms > 400 ? consecutive_silence_ms - 400 : 0;
+                size_t excess_samples = (excess_silence_ms * INMP441_SAMPLE_RATE_HZ) / 1000;
+                if (s_recording_samples > excess_samples) {
+                    s_recording_samples -= excess_samples;
+                }
+
+                ESP_LOGI(TAG, "Fin de frase detectado (%lu ms total, %lu ms activa, %u muestras grabadas)",
+                         (unsigned long)speech_duration_ms, (unsigned long)active_speech_ms, (unsigned int)s_recording_samples);
                 *out_heard_speech = true;
                 return ESP_OK;
             }
 
             if (speech_duration_ms >= max_speech_ms) {
                 ESP_LOGI(TAG, "Limite de duracion de frase alcanzado (%lu ms)", (unsigned long)speech_duration_ms);
-                microphone_stop_stream();
                 *out_heard_speech = true;
                 return ESP_OK;
             }
